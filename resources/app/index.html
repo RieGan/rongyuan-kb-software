@@ -1,0 +1,77 @@
+<!DOCTYPE html>
+<html>
+
+<head>
+  <meta charset="UTF-8" />
+  <style>
+    * {
+      margin: 0;
+      padding: 0;
+      box-sizing: border-box;
+    }
+
+    /* html,
+    body {
+      -webkit-app-region: drag;
+    } */
+
+    html,
+    body,
+    span,
+    #root {
+      width: 100%;
+      height: 100%;
+      overflow: hidden;
+      user-select: none;
+      box-sizing: border-box;
+    }
+
+    #drag {
+      -webkit-app-region: drag;
+    }
+
+    ul,
+    li,
+    input,
+    button,
+    label,
+    span,
+    textarea,
+    select,
+    p,
+    .image {
+      -webkit-app-region: no-drag;
+    }
+
+    .light-page {
+      color: #23f9e2;
+      outline: none;
+    }
+
+    .autoWidth {
+      white-space: pre-wrap;
+      overflow-wrap: break-word;
+    }
+
+    @font-face {
+      font-family: 'OpenSans-Regular';
+      src: url(./OpenSans-Regular.ttf)format('truetype');
+    }
+  </style>
+
+  <link rel="stylesheet" type="text/css" href="./node_modules/react-toastify/dist/ReactToastify.css" />
+</head>
+<!--
+  <body style="-webkit-app-region: drag;">
+    <div id="root"></div>
+  </body> -->
+
+<body>
+  <div id="root"></div>
+</body>
+
+<script>
+  require('./dist/index.js')
+</script>
+
+</html>

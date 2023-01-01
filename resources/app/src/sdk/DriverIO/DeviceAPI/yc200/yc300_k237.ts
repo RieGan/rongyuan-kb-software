@@ -1,0 +1,8 @@
+
+import { YC200Common } from "./YC200Common";
+import { defaultMatrix_yc300_k237 } from "./yc300_k237Matrix";
+
+
+export class YC300_K237 extends YC200Common {
+    defaultMatrix = defaultMatrix_yc300_k237
+}

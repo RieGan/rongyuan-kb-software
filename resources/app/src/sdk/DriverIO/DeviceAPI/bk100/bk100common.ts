@@ -1,0 +1,575 @@
+import { equals } from "ramda";
+import { numToRgb, rgbToNum } from "../../../../unitys/rgbNum";
+import { valueForKey } from "../../../../unitys/tableValueForKey";
+import { sleep } from "../../../../unitys/timeFunc";
+import { DJDev } from "../../proto/driver_pb";
+import { readMsg } from "../../usb/client";
+import { devlistList, HIDAttachSwich } from "../../usb/DetectSupportDevice";
+import { YC200Common } from "../yc200/YC200Common";
+import { defaultMatrix_bk100common } from "./bk100commonMatrix";
+import * as fs from 'fs'
+
+export class BK100COMMON extends YC200Common {
+    defaultMatrix = defaultMatrix_bk100common
+
+    send64 = async (arr: number[], checkSumType: 0 | 1 | 2 = 2, value: string = this.deviceType.devAddr.toString()) => {
+        //console.log(arr.concat(new Array(64 - arr.length)).length)
+        let sendBuf = Buffer.from(arr.concat(new Array(64 - arr.length)))
+        return await this.writeFeatureCmd(sendBuf, checkSumType, 0, value)
+    }
+
+    upgrade = async (filePath: Buffer, progressCallBack: (v: number) => void) => {
+        HIDAttachSwich(false)
+        //进入 bootloader
+        //进入 bootloader
+        let devicePath: string | undefined = undefined
+        if (this.deviceType.pid !== 0x2300) {//
+            console.log('发进入boot命令 0x7f , 0x55 , 0xaa , 0x55 , 0x82')
+            const r = await this.send64([0x7f, 0x55, 0xaa, 0x55, 0xaa], 0)
+            if (!r) {
+                HIDAttachSwich(true)
+                throw '发送 进入 boot 命令失败'
+            }
+            console.log('开始等待')
+            await sleep(1000 * 1)
+            console.log('等待结束')
+
+            console.log('开始扫描 hid 设备')
+
+            let devUpList: DJDev.AsObject[] | undefined
+            let findCount = 0
+
+            while ((devUpList?.length === 0 || devUpList === undefined) && findCount < 100) {
+                if (findCount % 10 === 0) console.log("!!!!!!!!!!!!!", devlistList)
+                await sleep(500)
+
+                devUpList = devlistList.filter(v => v.dev && v.dev.devtype === 1)
+
+                findCount++
+            }
+
+            if (devUpList?.length === 0 || devUpList === undefined) {
+                //alert('未检测到支持设备')
+                HIDAttachSwich(true)
+                console.log('未检测到BOOT设备')
+                return false
+            }
+
+            if (equals(devUpList[0].dev?.path, '')) {
+                console.log('找不到devicePath')
+                return false
+            }
+
+            console.log('开始读取文件')
+            await sleep(1000)
+
+            devicePath = devUpList[0].dev?.path
+        }
+
+        devicePath = devicePath === undefined ? this.deviceType.devAddr.toString() : devicePath
+
+        const rawBuf = fs.readFileSync(filePath)
+
+        const fBuf = rawBuf.slice(0x8080)
+
+        console.log('升级文件大小：', fBuf.length / 1024 + 'kb')
+        const onePackDataLength = 64
+        const _dataPacketNum = Math.ceil(fBuf.length / (onePackDataLength))
+        console.log('发送数据包总数', _dataPacketNum)
+
+        const int3buffLenth = Buffer.alloc(4)
+        int3buffLenth.writeInt32LE(fBuf.length, 0)
+
+        const tt = [...fBuf, ...new Array(_dataPacketNum * onePackDataLength - fBuf.length).fill(0xff)]
+
+        const startBoot = await this.send64([1], 0, devicePath)
+        if (!startBoot) {
+            console.log('发送 开始Boot操作 命令失败')
+            return false
+        }
+        console.log('开始Boot操作  等待5S')
+        await sleep(5000)
+
+        const downTmpBuf = Buffer.alloc(5).fill(0)
+        downTmpBuf[0] = 0x02
+        downTmpBuf[1] = (_dataPacketNum & 0x000000ff)
+        downTmpBuf[2] = (_dataPacketNum & 0x0000ff00) >> 8
+        downTmpBuf[3] = (_dataPacketNum & 0x00ff0000) >> 16
+        downTmpBuf[4] = (_dataPacketNum & 0xff000000) >> 24
+
+        const downPacketNum = await this.send64([...downTmpBuf], 0, devicePath)
+        // log16Num('下载数据:', [...downTmpBuf])
+        if (!downPacketNum) {
+            HIDAttachSwich(true)
+            console.log('发送 下载数据 命令失败')
+            return false
+        }
+
+        //cmd_ota_data
+        console.log('发送数据包开始')
+        for (let i = 0; i < _dataPacketNum; i++) {
+            console.time('数据包发送' + i)
+            const packDataLength = i * onePackDataLength > tt.length ? onePackDataLength - (i * onePackDataLength - tt.length) : onePackDataLength
+            const tmp = await this.send64([...tt.slice(i * onePackDataLength, i * onePackDataLength + packDataLength)], 2, devicePath)
+            if (!tmp) {
+                console.log('数据包发送失败')
+                return false
+            }
+            progressCallBack(i / _dataPacketNum)
+            console.timeEnd('数据包发送' + i)
+        }
+        console.log('发送数据包结束')
+
+        downTmpBuf[0] = 0x83
+        await this.send64([...downTmpBuf], 0, devicePath)
+        await sleep(20)
+        const upLenNum = await readMsg(devicePath)
+        if (upLenNum === undefined) {
+            HIDAttachSwich(true)
+            // log16Num('上位机发送长度验证get:', upLenNum);
+            console.log(`读取 上位机发送长度验证1 命令失败`)
+            return false
+        }
+
+        await sleep(20)
+        await this.send64([0x7f], 0, devicePath)
+        progressCallBack(1)
+        HIDAttachSwich(true)
+        return true
+    }
+
+    setLightSetting = async (lightSet: LightSetting) => {
+        const b = Buffer.alloc(64)
+
+
+        b[0] = this.FEA_CMD_SET_LEDPARAM
+
+        let effect: number = 0
+        let speed: number = 0
+        let brightness: number = 0
+        let option: number = 7
+        let dazzle = lightSet.dazzle
+        const n = dazzle ? this.DAZZLE : this.NORMAL
+        const musicKey = dazzle ? 0 : 4
+
+        switch (lightSet.type) {
+            case 'LightOff':
+                effect = 0x00
+                break
+            case 'LightAlwaysOn':
+                effect = 0x01
+                brightness = lightSet.value
+                option = n
+                break
+            case 'LightBreath':
+                effect = 0x02
+                speed = lightSet.speed
+                brightness = lightSet.value
+                option = n
+                break
+            case 'LightNeon':
+                effect = 0x03
+                speed = lightSet.speed
+                brightness = lightSet.value
+                break
+            case 'LightWave':
+                effect = 0x04
+                speed = lightSet.speed
+                option = lightSet.option !== undefined ? (this.WAVEOP[lightSet.option] << 4 | n) : (this.WAVEOP['right'] << 4 | n)
+                brightness = lightSet.value
+                break
+            case 'LightRipple':
+                effect = 0x05
+                speed = lightSet.speed
+                brightness = lightSet.value
+                option = n
+                break
+            case 'LightRaindrop':
+                effect = 0x06
+                speed = lightSet.speed
+                brightness = lightSet.value
+                option = n
+                break
+            case 'LightSnake':
+                effect = 0x07
+                speed = lightSet.speed
+                option = lightSet.option === 'z' || lightSet.option === undefined ? (0 << 4 | n) : (1 << 4 | n)
+                brightness = lightSet.value
+                break
+            case 'LightPressAction':
+                effect = 0x08
+                speed = lightSet.speed
+                brightness = lightSet.value
+                option = n
+                break
+            case 'LightConverage':
+                effect = 0x09
+                speed = lightSet.speed
+                brightness = lightSet.value
+                option = n
+                break
+            case 'LightSineWave':
+                effect = 0x0A
+                speed = lightSet.speed
+                brightness = lightSet.value
+                option = n
+                break
+            case 'LightKaleidoscope':
+                effect = 0x0B
+                speed = lightSet.speed
+                option = lightSet.option === 'out' || lightSet.option === undefined ? (0 << 4 | n) : (1 << 4 | n)
+                brightness = lightSet.value
+                break
+            case 'LightLineWave':
+                effect = 0x0C
+                speed = lightSet.speed
+                brightness = lightSet.value
+                option = lightSet.option === 'right' || lightSet.option === undefined ? (0 << 4 | n) : (1 << 4 | n)
+                break
+            case 'LightUserPicture':
+                effect = 0x0D
+                option = lightSet.option !== undefined ? this.USEROP[lightSet.option] : 0
+                brightness = lightSet.value
+                break
+            case 'LightLaser':
+                effect = 0x0E
+                speed = lightSet.speed
+                brightness = lightSet.value
+                option = n
+                break
+            case 'LightCircleWave':
+                effect = 0x0F
+                speed = lightSet.speed
+                brightness = lightSet.value
+                option = lightSet.option === 'anti-clockwise' || lightSet.option === undefined ? (0 << 4 | n) : (1 << 4 | n)
+                break
+            case 'LightDazzing':
+                effect = 0x10
+                speed = lightSet.speed
+                brightness = lightSet.value
+                option = n
+                break
+            case 'LightRainDown':
+                effect = 0x11
+                speed = lightSet.speed
+                brightness = lightSet.value
+                option = n
+                break
+            case 'LightMeteor':
+                effect = 0x12
+                speed = lightSet.speed
+                brightness = lightSet.value
+                option = n
+                break
+            case 'LightPressActionOff':
+                effect = 0x13
+                speed = lightSet.speed
+                brightness = lightSet.value
+                option = n
+                break
+            case 'LightMusicFollow3':
+                effect = 0x14
+                option = lightSet.option === undefined || lightSet.option === 'upright' ? (0 << 4) | musicKey : this.MP[lightSet.option] << 4 | musicKey
+                brightness = lightSet.value
+                break
+            case 'LightScreenColor':
+                effect = 0x15
+                brightness = 4
+                break
+            case 'LightMusicFollow2':
+                effect = 0x16
+                brightness = lightSet.value
+                option = lightSet.option === undefined || lightSet.option === 'upright' ? (0 << 4) | musicKey : this.MP[lightSet.option] << 4 | musicKey
+                break
+            case 'LightTrain':
+                effect = 0x17
+                speed = lightSet.speed
+                brightness = lightSet.value
+                option = n
+                break
+            case 'LightFireWorks':
+                effect = 0x18
+                speed = lightSet.speed
+                brightness = lightSet.value
+                option = n
+                break
+            default:
+                break
+        }
+
+        b[1] = effect
+        b[2] = this.MAXSPEED - speed
+        b[3] = brightness
+        b[4] = option
+        if ('rgb' in lightSet && lightSet.rgb !== undefined) {
+            let rgbTemp = lightSet.rgb
+            if (rgbTemp === 0xffffff) rgbTemp = 0xfafffa
+            const rgb = numToRgb(rgbTemp)
+            b[5] = rgb.r
+            b[6] = rgb.g
+            b[7] = rgb.b
+        }
+        if (lightSet.type === 'LightUserPicture') {
+            b[5] = 0
+            b[6] = 0xc8
+            b[7] = 0xc8
+        }
+
+        // const newB = await this.getBufEi(b)
+        const buf = await this.writeFeatureCmd(b, 1, 500)
+
+        if (!buf) return false
+        await sleep(this.COMMONDELAY)
+        return true
+    }
+
+    getLightSetting = async (): Promise<LightSetting | undefined> => {
+        const b = Buffer.alloc(64)
+        b[0] = this.FEA_CMD_GET_LEDPARAM
+        // const newB = await this.getBufSe(b)
+        const buf = await this.commomFeature(b, 0)
+        if (buf === undefined) return undefined
+        const effect = buf[1]
+        const speed = this.MAXSPEED - buf[2]
+        const brightness = buf[3]
+        const option = buf[4]
+        let rgb = rgbToNum(buf[5], buf[6], buf[7])
+        const option1 = option >> 4
+        const option2 = option & 0b1111
+        const optionToRgb = (op: number) => {
+            if (op === this.DAZZLE || op === this.NORMAL) return
+            const trgb = this.COMMONCOLOR[op]
+            if (trgb !== undefined) rgb = trgb
+
+        }
+        const dazzle = option2 === this.DAZZLE ? true : false
+        const musicDazzle = option2 === 0 ? true : false
+
+        if (rgb === 0xfafffa) rgb = 0xffffff
+        //console.log('!!!!!', effect, option)
+        switch (effect) {
+            case 0:
+                return {
+                    type: 'LightOff',
+                }
+            case 1:
+                optionToRgb(option2)
+                return {
+                    type: 'LightAlwaysOn',
+                    value: brightness,
+                    rgb: rgb,
+                    dazzle: dazzle
+                }
+            case 2:
+                optionToRgb(option2)
+                return {
+                    type: 'LightBreath',
+                    value: brightness,
+                    speed: speed,
+                    rgb: rgb,
+                    dazzle: dazzle
+                }
+            case 3:
+                return {
+                    type: 'LightNeon',
+                    value: brightness,
+                    speed: speed,
+                    option: option1 === 0 ? 'Default' : 'Random',
+                }
+            case 4:
+                optionToRgb(option2)
+                const wOp = valueForKey(this.WAVEOP, option1)
+                return {
+                    type: 'LightWave',
+                    value: brightness,
+                    speed: speed,
+                    option: wOp === undefined ? 'right' : wOp,
+                    rgb: rgb,
+                    dazzle: dazzle
+                }
+            case 5:
+                optionToRgb(option2)
+
+                return {
+                    type: 'LightRipple',
+                    value: brightness,
+                    speed: speed,
+                    option: option1 === 0 ? 'full' : 'single',
+                    rgb: rgb,
+                    dazzle: dazzle
+                }
+            case 6:
+                optionToRgb(option2)
+                return {
+                    type: 'LightRaindrop',
+                    value: brightness,
+                    speed: speed,
+                    rgb: rgb,
+                    dazzle: dazzle
+                }
+            case 7:
+                optionToRgb(option2)
+                return {
+                    type: 'LightSnake',
+                    value: brightness,
+                    speed: speed,
+                    option: option1 === 0 ? 'z' : 'return',
+                    rgb: rgb,
+                    dazzle: dazzle
+                }
+            case 8:
+                optionToRgb(option2)
+                return {
+                    type: 'LightPressAction',
+                    value: brightness,
+                    speed: speed,
+                    option: option1 === 0 ? 'onToOff' : 'offToOn',
+                    rgb: rgb,
+                    dazzle: dazzle
+                }
+            case 9:
+                optionToRgb(option2)
+                return {
+                    type: 'LightConverage',
+                    value: brightness,
+                    speed: speed,
+                    rgb: rgb,
+                    dazzle: dazzle
+                }
+            case 0x0A:
+                optionToRgb(option2)
+                return {
+                    type: 'LightSineWave',
+                    value: brightness,
+                    speed: speed,
+                    rgb: rgb,
+                    dazzle: dazzle
+                }
+            case 0x0B:
+                optionToRgb(option2)
+                return {
+                    type: 'LightKaleidoscope',
+                    option: option1 === 0 ? 'out' : 'in',
+                    value: brightness,
+                    speed: speed,
+                    rgb: rgb,
+                    dazzle: dazzle
+                }
+            case 0x0C:
+                optionToRgb(option2)
+                return {
+                    type: 'LightLineWave',
+                    option: option1 === 0 ? 'right' : 'left',
+                    value: brightness,
+                    speed: speed,
+                    rgb: rgb,
+                    dazzle: dazzle
+                }
+            case 0x0E:
+                optionToRgb(option2)
+                return {
+                    type: 'LightLaser',
+                    value: brightness,
+                    speed: speed,
+                    rgb: rgb,
+                    dazzle: dazzle
+                }
+            case 0x0F:
+                optionToRgb(option2)
+                return {
+                    type: 'LightCircleWave',
+                    value: brightness,
+                    speed: speed,
+                    rgb: rgb,
+                    option: option1 === 0 ? 'anti-clockwise' : 'clockwise',
+                    dazzle: dazzle
+                }
+            case 0x10:
+                optionToRgb(option2)
+                return {
+                    type: 'LightDazzing',
+                    value: brightness,
+                    speed: speed,
+                    rgb: rgb,
+                    dazzle: dazzle
+                }
+            case 0x11:
+                optionToRgb(option2)
+                return {
+                    type: 'LightRainDown',
+                    value: brightness,
+                    speed: speed,
+                    rgb: rgb,
+                    dazzle: dazzle
+                }
+            case 0x12:
+                optionToRgb(option2)
+                return {
+                    type: 'LightMeteor',
+                    value: brightness,
+                    speed: speed,
+                    rgb: rgb,
+                    dazzle: dazzle
+                }
+            case 0x13:
+                optionToRgb(option2)
+                return {
+                    type: 'LightPressActionOff',
+                    value: brightness,
+                    speed: speed,
+                    rgb: rgb,
+                    dazzle: dazzle
+                }
+            case 0x0D:
+                const uOp = valueForKey(this.USEROP, option)
+                return {
+                    type: 'LightUserPicture',
+                    value: brightness,
+                    option: uOp === undefined ? '1' : uOp,
+                }
+            case 0x14:
+                const op = valueForKey(this.MP, option1)
+                return {
+                    type: 'LightMusicFollow3',
+                    value: brightness,
+                    option: op === undefined ? 'upright' : op,
+                    rgb: rgbToNum(buf[5], buf[6], buf[7]),
+                    dazzle: musicDazzle
+                }
+            case 0x15:
+                return {
+                    type: 'LightScreenColor',
+                    value: 4,
+                }
+            case 0x16:
+                const op2 = valueForKey(this.MP, option1)
+                return {
+                    type: 'LightMusicFollow2',
+                    option: op2 === undefined ? 'upright' : op2,
+                    value: brightness,
+                    rgb: rgbToNum(buf[5], buf[6], buf[7]),
+                    dazzle: musicDazzle
+                }
+            case 0x17:
+                optionToRgb(option2)
+                return {
+                    type: 'LightTrain',
+                    value: brightness,
+                    speed: speed,
+                    rgb: rgb,
+                    dazzle: dazzle
+                }
+            case 0x18:
+                optionToRgb(option2)
+                return {
+                    type: 'LightFireWorks',
+                    value: brightness,
+                    speed: speed,
+                    rgb: rgb,
+                    dazzle: dazzle
+                }
+            default:
+                return undefined
+        }
+    }
+}
